@@ -5,8 +5,10 @@ from app.db.postgres import get_db
 from app.db.redis_db import redis_service
 from app.models.company import Company, StockPrice, FinancialStatement, FinancialMetric
 from app.config import settings
+from app.services.fmp_service import FMPService, normalise_statement
 from typing import Optional, List
 from pydantic import BaseModel
+from loguru import logger
 import uuid
 
 router = APIRouter(prefix="/companies", tags=["Companies"])
@@ -154,18 +156,47 @@ async def get_price_history(
 @router.get("/{ticker}/financials")
 async def get_financials(
     ticker: str,
-    statement_type: str = Query("income", regex="^(income|balance|cashflow)$"),
-    period_type: str = Query("annual", regex="^(annual|quarterly)$"),
+    statement_type: str = Query("income", pattern="^(income|balance|cashflow)$"),
+    period_type: str = Query("annual", pattern="^(annual|quarterly)$"),
+    limit: int = Query(8, ge=1, le=20),
     db: AsyncSession = Depends(get_db),
 ):
+    """
+    Return financial statements for a company.
+
+    Strategy (fastest → slowest):
+      1. Redis cache (TTL 1 h)
+      2. PostgreSQL DB (persisted from previous FMP fetch)
+      3. Live FMP API fetch → normalise → persist to DB → cache in Redis
+
+    Supports any ticker that FMP recognises, including:
+      - US equities  : AAPL, MSFT
+      - Indian NSE   : RELIANCE.NS, TCS.NS
+      - Indian BSE   : RELIANCE.BO
+    """
+    ticker_upper = ticker.upper()
+    cache_key = f"financials:{ticker_upper}:{statement_type}:{period_type}:{limit}"
+
+    # ── 1. Redis cache ──────────────────────────────────────────
+    cached = await redis_service.get(cache_key)
+    if cached:
+        return cached
+
+    # ── 2. Resolve company from DB ──────────────────────────────
     company_result = await db.execute(
-        select(Company).where(func.upper(Company.ticker) == ticker.upper())
+        select(Company).where(func.upper(Company.ticker) == ticker_upper)
     )
     company = company_result.scalar_one_or_none()
+
     if not company:
-        raise HTTPException(status_code=404, detail="Company not found")
-    
-    result = await db.execute(
+        raise HTTPException(
+            status_code=404,
+            detail=f"Company '{ticker}' not found in database. "
+                   f"Seed it first via POST /api/v1/companies/",
+        )
+
+    # ── 3. Check PostgreSQL for existing statements ─────────────
+    db_result = await db.execute(
         select(FinancialStatement)
         .where(
             FinancialStatement.company_id == company.id,
@@ -173,17 +204,97 @@ async def get_financials(
             FinancialStatement.period_type == period_type,
         )
         .order_by(FinancialStatement.period_end.desc())
-        .limit(10)
+        .limit(limit)
     )
-    statements = result.scalars().all()
-    
-    return [
+    existing = db_result.scalars().all()
+
+    if existing:
+        data = _format_statements(existing, source="database")
+        await redis_service.set(cache_key, data, ttl=settings.cache_ttl_company)
+        return data
+
+    # ── 4. Live fetch from FMP ──────────────────────────────────
+    if not settings.fmp_api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="FMP_API_KEY is not configured. "
+                   "Set it in your .env file to enable live financial data.",
+        )
+
+    logger.info(f"Fetching live FMP data: {ticker} | {statement_type} | {period_type}")
+    fmp = FMPService(api_key=settings.fmp_api_key)
+    raw_statements = await fmp.fetch_financials(
+        ticker=ticker,            # FMP accepts RELIANCE.NS directly
+        statement_type=statement_type,
+        period_type=period_type,
+        limit=limit,
+    )
+
+    if not raw_statements:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No {period_type} {statement_type} statements found for '{ticker}' "
+                   f"on FMP. The ticker may not be covered by your FMP plan.",
+        )
+
+    # ── 5. Normalise + persist to DB ────────────────────────────
+    persisted: list[FinancialStatement] = []
+    for raw in raw_statements:
+        try:
+            period_end = raw.get("date", "")          # "2024-03-31"
+            fiscal_year = int(period_end[:4]) if period_end else None
+            fiscal_quarter_str = raw.get("period", "") # "Q1", "Q2", "FY"
+            fiscal_quarter = None
+            if fiscal_quarter_str.startswith("Q"):
+                try:
+                    fiscal_quarter = int(fiscal_quarter_str[1])
+                except ValueError:
+                    pass
+
+            normalised = normalise_statement(statement_type, raw)
+
+            stmt = FinancialStatement(
+                id=uuid.uuid4(),
+                company_id=company.id,
+                period_type=period_type,
+                fiscal_year=fiscal_year,
+                fiscal_quarter=fiscal_quarter,
+                period_end=period_end,
+                currency=raw.get("reportedCurrency", "USD"),
+                statement_type=statement_type,
+                data=normalised,
+                source="fmp",
+                filing_url=raw.get("link"),
+            )
+            db.add(stmt)
+            persisted.append(stmt)
+        except Exception as e:
+            logger.warning(f"Could not persist FMP statement for {ticker}: {e}")
+
+    await db.flush()
+    logger.info(f"Persisted {len(persisted)} FMP statements for {ticker} to DB")
+
+    # ── 6. Format + cache + return ──────────────────────────────
+    data = _format_statements(persisted, source="fmp_live")
+    await redis_service.set(cache_key, data, ttl=settings.cache_ttl_company)
+    return data
+
+
+def _format_statements(statements, source: str) -> dict:
+    """Serialise FinancialStatement ORM objects into the API response shape."""
+    items = [
         {
-            "fiscal_year": s.fiscal_year,
+            "fiscal_year":    s.fiscal_year,
             "fiscal_quarter": s.fiscal_quarter,
-            "period_end": s.period_end,
-            "currency": s.currency,
-            "data": s.data,
+            "period_end":     s.period_end,
+            "currency":       s.currency,
+            "data":           s.data,
         }
         for s in statements
     ]
+    return {
+        "count":  len(items),
+        "source": source,
+        "statements": items,
+    }
+
