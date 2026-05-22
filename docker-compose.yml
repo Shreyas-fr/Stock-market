@@ -1,0 +1,210 @@
+version: "3.9"
+
+services:
+  # ─── Databases ───────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: sci_postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-sci_db}
+      POSTGRES_USER: ${POSTGRES_USER:-sci_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sci_password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/docker/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-sci_user}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  neo4j:
+    image: neo4j:5.15-community
+    container_name: sci_neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-sci_password}
+      NEO4J_PLUGINS: '["apoc", "graph-data-science"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*,gds.*"
+    ports:
+      - "7474:7474"  # Browser
+      - "7687:7687"  # Bolt
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD", "cypher-shell", "-u", "neo4j", "-p", "${NEO4J_PASSWORD:-sci_password}", "RETURN 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: sci_redis
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-sci_password}
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-sci_password}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.11.0
+    container_name: sci_elasticsearch
+    environment:
+      - discovery.type=single-node
+      - ES_JAVA_OPTS=-Xms512m -Xmx512m
+      - ELASTIC_PASSWORD=${ELASTIC_PASSWORD:-sci_password}
+      - xpack.security.enabled=true
+    ports:
+      - "9200:9200"
+    volumes:
+      - es_data:/usr/share/elasticsearch/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -u elastic:${ELASTIC_PASSWORD:-sci_password} http://localhost:9200/_cluster/health | grep -q '\"status\":\"green\"\\|\"status\":\"yellow\"'"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.11.0
+    container_name: sci_kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+      - ELASTICSEARCH_USERNAME=elastic
+      - ELASTICSEARCH_PASSWORD=${ELASTIC_PASSWORD:-sci_password}
+    ports:
+      - "5601:5601"
+    depends_on:
+      elasticsearch:
+        condition: service_healthy
+
+  # ─── Backend API ──────────────────────────────────────────────
+  api:
+    build:
+      context: ./services/api
+      dockerfile: Dockerfile
+    container_name: sci_api
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-sci_user}:${POSTGRES_PASSWORD:-sci_password}@postgres:5432/${POSTGRES_DB:-sci_db}
+      - NEO4J_URI=bolt://neo4j:7687
+      - NEO4J_USER=neo4j
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD:-sci_password}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-sci_password}@redis:6379/0
+      - ELASTICSEARCH_URL=http://elastic:${ELASTIC_PASSWORD:-sci_password}@elasticsearch:9200
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./services/api:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  # ─── AI Service ───────────────────────────────────────────────
+  ai-service:
+    build:
+      context: ./services/ai-service
+      dockerfile: Dockerfile
+    container_name: sci_ai
+    env_file: .env
+    ports:
+      - "8001:8001"
+    volumes:
+      - ./services/ai-service:/app
+    depends_on:
+      - redis
+      - elasticsearch
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload
+
+  # ─── Celery Worker (Ingestion) ────────────────────────────────
+  worker:
+    build:
+      context: ./services/ingestion
+      dockerfile: Dockerfile
+    container_name: sci_worker
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER:-sci_user}:${POSTGRES_PASSWORD:-sci_password}@postgres:5432/${POSTGRES_DB:-sci_db}
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-sci_password}@redis:6379/0
+    volumes:
+      - ./services/ingestion:/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: celery -A celery_app worker --loglevel=info --concurrency=4
+
+  # ─── Celery Beat (Scheduler) ──────────────────────────────────
+  beat:
+    build:
+      context: ./services/ingestion
+      dockerfile: Dockerfile
+    container_name: sci_beat
+    env_file: .env
+    volumes:
+      - ./services/ingestion:/app
+    depends_on:
+      - redis
+    command: celery -A celery_app beat --loglevel=info
+
+  # ─── Flower (Celery Monitor) ──────────────────────────────────
+  flower:
+    image: mher/flower:2.0
+    container_name: sci_flower
+    environment:
+      - CELERY_BROKER_URL=redis://:${REDIS_PASSWORD:-sci_password}@redis:6379/0
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+
+  # ─── Risk Engine ──────────────────────────────────────────────
+  risk-engine:
+    build:
+      context: ./services/risk-engine
+      dockerfile: Dockerfile
+    container_name: sci_risk
+    env_file: .env
+    ports:
+      - "8002:8002"
+    depends_on:
+      - postgres
+      - neo4j
+      - redis
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8002 --reload
+
+#  # ─── Frontend ─────────────────────────────────────────────────
+#  frontend:
+#    build:
+#      context: ./frontend
+#      dockerfile: Dockerfile
+#    container_name: sci_frontend
+#    ports:
+#      - "3000:3000"
+#    environment:
+#      - NEXT_PUBLIC_API_URL=http://localhost:8000/api/v1
+#      - NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws/v1
+#    volumes:
+#      - ./frontend:/app
+#      - /app/node_modules
+#      - /app/.next
+#    command: npm run dev
+
+volumes:
+  postgres_data:
+  neo4j_data:
+  neo4j_logs:
+  redis_data:
+  es_data:
